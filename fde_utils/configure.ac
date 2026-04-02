@@ -39,15 +39,22 @@ fi
 
 AM_CONDITIONAL(USE_GLIB, test "x${with_glib}" = "xyes")
 
-AC_CHECK_HEADERS([
-    ext4_utils/ext4_utils.h
-    ext4_utils/ext4_kernel_headers.h
-], [], [AC_MSG_ERROR([ext4_utils headers not found])])
+PKG_CHECK_MODULES([EXT2FS], [ext2fs],
+    [fs_backend_ext2fs=yes],
+    [fs_backend_ext2fs=no])
 
-PKG_CHECK_MODULES(EXT4_UTILS, ext4_utils)
+if test "x$fs_backend_ext2fs" = "xyes"; then
+    PKG_CHECK_MODULES([COM_ERR], [com_err])
 
-AC_SUBST(EXT4_UTILS_CFLAGS)
-AC_SUBST(EXT4_UTILS_LIBS)
+    AC_MSG_NOTICE([ext2fs backend found])
+else
+    AC_MSG_ERROR([ext2fs backend not found])
+fi
+
+AC_SUBST(EXT2FS_CFLAGS)
+AC_SUBST(EXT2FS_LIBS)
+AC_SUBST(COM_ERR_CFLAGS)
+AC_SUBST(COM_ERR_LIBS)
 
 AC_CONFIG_FILES([
     Makefile

@@ -24,22 +24,23 @@
  */
 #define _FILE_OFFSET_BITS 64
 
-#include <inttypes.h>
 #include <stdint.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <inttypes.h>
+#include <string.h>
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/types.h>
 
 #include <linux/fs.h>
 
-#include <ext4_utils/ext4_kernel_headers.h>
-#include <ext4_utils/ext4_utils.h>
+#include <ext2fs/ext2_fs.h>
+#include <ext2fs/ext2fs.h>
+#include <com_err.h>
 
 #include "encrypt_inplace.h"
 #include "fde_core.h"
@@ -112,7 +113,7 @@ static enc_inplace_err_t inplace_init_fs(struct in_place_encrypter *e,
 
     uint64_t mb = (blocks_to_encrypt * (uint64_t)block_size) / 1000000ULL;
     LOGD("Encrypting ext4 filesystem on %s via %s\n",
-         e->real_blkdev, e->crypto_blkdev);
+        e->real_blkdev, e->crypto_blkdev);
     LOGD("%" PRIu64 " blocks (%" PRIu64 " MB) of %" PRIu64 " blocks "
         "are in-use (estimated).\n",
         blocks_to_encrypt, mb, total_blocks);
@@ -176,114 +177,90 @@ static bool process_used_block(struct in_place_encrypter *e, uint64_t block_num)
     return true;
 }
 
-static uint64_t first_block_in_group(uint32_t group) {
-    return (uint64_t)aux_info.first_data_block +
-           (uint64_t)group * (uint64_t)info.blocks_per_group;
-}
-
-static uint32_t num_blocks_in_group(uint32_t group) {
-    uint64_t first = first_block_in_group(group);
-    uint64_t remaining = aux_info.len_blocks - first;
-    return (remaining < (uint64_t)info.blocks_per_group) ?
-            (uint32_t)remaining : (uint32_t)info.blocks_per_group;
-}
-
-/*
- * In block groups with an uninitialized block bitmap, original code encrypts
- * only the backup superblock and the block group descriptors (if present).
- * num = 1 + aux_info.bg_desc_blocks if group has superblock; else 0
- */
-static uint32_t num_base_meta_blocks_in_group(uint32_t group) {
-    if (!ext4_bg_has_super_block((int)group))
-        return 0;
-    return 1u + (uint32_t)aux_info.bg_desc_blocks;
-}
-
-static bool read_ext4_block_bitmap(struct in_place_encrypter *e,
-                                   uint32_t group, uint8_t *buf)
+static int block_iter_cb(
+        ext2_filsys fs,
+        blk64_t     *blocknr,
+        e2_blkcnt_t blkcnt,
+        blk64_t     ref_blk,
+        int         ref_offset,
+        void        *priv)
 {
-    uint64_t bb = (uint64_t)aux_info.bg_desc[group].bg_block_bitmap;
-    uint64_t offset = bb * (uint64_t)info.block_size;
+    struct in_place_encrypter *e = priv;
 
-    ssize_t r = pread(e->realfd, buf, info.block_size, (off_t)offset);
-    if (r != (ssize_t)info.block_size) {
-        /* log if you want; keep behavior: return false */
-        return false;
-    }
-    return true;
+    /* skip metadata blocks */
+    if (*blocknr == 0)
+        return 0;
+
+    if (!process_used_block(e, (uint64_t)*blocknr))
+        return BLOCK_ABORT;
+
+    return 0;
 }
 
-enc_inplace_err_t encrypt_in_place_ext4(struct in_place_encrypter *e)
+enc_inplace_err_t encrypt_inplace_ext4_ext2fs(struct in_place_encrypter *e)
 {
     enc_inplace_err_t ret = ENC_SUCCESS;
+    ext2_filsys fs;
+    errcode_t err;
 
-    /* If setjmp triggers, treat as FS not found */
-    if (setjmp(setjmp_env)) { // NOLINT
-        ret = ENC_FS_NOT_FOUND;
-        goto out;
-    }
-
-    if (read_ext(e->realfd, 0) != 0)
+    /* open filesystem (read-only, no journal replay) */
+    err = ext2fs_open(
+        e->real_blkdev,
+        EXT2_FLAG_SOFTSUPP_FEATURES |
+        EXT2_FLAG_64BITS |
+        EXT2_FLAG_IGNORE_CSUM_ERRORS,
+        0, 0, unix_io_manager, &fs);
+    if (err) {
+        LOGE("ext2fs_open failed: %s.\n", error_message(err));
         return ENC_FS_NOT_FOUND;
+    }
 
-    /* Compute blocks_to_encrypt */
-    uint64_t blocks_to_encrypt = 0;
-    for (uint32_t group = 0; group < (uint32_t)aux_info.groups; group++) {
-        if (aux_info.bg_desc[group].bg_flags & EXT4_BG_BLOCK_UNINIT) {
-            blocks_to_encrypt += (uint64_t)num_base_meta_blocks_in_group(group);
-        } else {
-            uint32_t blocks_in_group = num_blocks_in_group(group);
-            uint32_t free_blocks = (uint32_t)aux_info.bg_desc[group].bg_free_blocks_count;
-            blocks_to_encrypt += (uint64_t)(blocks_in_group - free_blocks);
+    /* Read block bitmap so we can walk allocated (in-use) blocks */
+    err = ext2fs_read_block_bitmap(fs);
+    if (err) {
+            LOGE("ext2fs_read_block_bitmap failed: %s.\n", error_message(err));
+            ret = ENC_FAILURE;
+            goto fail;
+    }
+
+    blk64_t total_blocks = ext2fs_blocks_count(fs->super);
+
+    /*
+     * Count allocated blocks to make progress reporting meaningful.
+     * (One extra pass over the bitmap; acceptable and keeps logs sane.)
+     */
+    uint64_t used_blocks = 0;
+    for (blk64_t blk = 0; blk < total_blocks; blk++) {
+        if (ext2fs_test_block_bitmap2(fs->block_map, blk))
+                used_blocks++;
+    }
+
+    ret = inplace_init_fs(e, used_blocks, (uint64_t)total_blocks, fs->blocksize);
+    if (ret != ENC_SUCCESS) {
+        ret = ENC_FAILURE;
+        goto fail;
+    }
+
+    /* Encrypt each allocated block (bitmap bit == 1) */
+    for (blk64_t blk = 0; blk < total_blocks; blk++) {
+        if (!ext2fs_test_block_bitmap2(fs->block_map, blk))
+                continue;
+        if (!process_used_block(e, (uint64_t)blk)) {
+                ret = ENC_FAILURE;
+                goto fail;
         }
     }
 
-    ret = inplace_init_fs(e, blocks_to_encrypt, aux_info.len_blocks, info.block_size);
-    if (ret != ENC_SUCCESS)
-        return ret;
-
-    /* Encrypt each block group */
-    uint8_t *block_bitmap = (uint8_t *)malloc(info.block_size);
-    if (!block_bitmap)
-        return ENC_FAILURE;
-
-    for (uint32_t group = 0; group < (uint32_t)aux_info.groups; group++) {
-
-        if (!read_ext4_block_bitmap(e, group, block_bitmap)) {
-            free(block_bitmap);
-            return ENC_FAILURE;
-        }
-
-        uint64_t first_blk = first_block_in_group(group);
-        bool uninit = (aux_info.bg_desc[group].bg_flags & EXT4_BG_BLOCK_UNINIT) != 0;
-
-        uint32_t block_count = uninit ?
-            num_base_meta_blocks_in_group(group) :
-            num_blocks_in_group(group);
-
-        /* Encrypt each used block in the block group */
-        for (uint32_t i = 0; i < block_count; i++) {
-            if (uninit || bitmap_get_bit(block_bitmap, i)) {
-                if (!process_used_block(e, first_blk + (uint64_t)i)) {
-                    free(block_bitmap);
-                    return ENC_FAILURE;
-                }
-            }
-        }
-    }
-
-out:
-    if (block_bitmap)
-        free(block_bitmap);
+fail:
+    ext2fs_close(fs);
     return ret;
 }
 
-
-bool do_encrypt_inplcae(struct in_place_encrypter *e)
+bool do_encrypt_inplace(struct in_place_encrypter *e)
 {
     enc_inplace_err_t rc;
 
-    rc = encrypt_in_place_ext4(e);
+    rc = encrypt_inplace_ext4_ext2fs(e);
     if (rc != ENC_FS_NOT_FOUND)
         return rc == ENC_SUCCESS;
 
@@ -332,7 +309,7 @@ bool encrypt_inplace(const char *crypto_blkdev,
 
     encrypter.fs_type = fs_type;
 
-    bool success = do_encrypt_inplcae(&encrypter);
+    bool success = do_encrypt_inplace(&encrypter);
 
     if (success)
         success &= encrypt_pending_data(&encrypter);
