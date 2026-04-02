@@ -24,7 +24,8 @@ AM_CPPFLAGS = -D__packed__= \
     -DFEATURE_LE_DIAG \
     -DOE \
     $(LOCAL_INCLUDE_PATHS) \
-    $(EXT4_UTILS_CFLAGS)
+    $(EXT2FS_CFLAGS) \
+    $(COM_ERR_CFLAGS)
 
 h_sources = \
     inc/fde_core.h \
@@ -50,12 +51,11 @@ fde_utils_CC = @CC@
 fde_utils_SOURCES = $(c_sources) $(h_sources)
 fde_utils_CPPFLAGS = $(AM_CPPFLAGS)
 fde_utils_CFLAGS = $(AM_CFLAGS)
-fde_utils_LDFLAGS = -lpthread -lrt -ldl libkm_contract_stub.la $(EXT4_UTILS_LIBS)
-fde_utils_LDADD = -ldl libkm_contract_stub.la $(EXT4_UTILS_LIBS)
+fde_utils_LDADD = -ldl libkm_contract_stub.la $(EXT2FS_LIBS) $(COM_ERR_LIBS)
 
 if USE_GLIB
 fde_utils_CFLAGS += -DUSE_GLIB $(GLIB_CFLAGS)
-fde_utils_LDFLAGS += $(GLIB_LIBS)
+fde_utils_LDFLAGS = $(GLIB_LIBS)
 endif
 
 # Install headers
