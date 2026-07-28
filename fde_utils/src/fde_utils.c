@@ -77,8 +77,11 @@ int main(int argc,char *argv[])
 
             fde_partition = argv[2];
             mount_point = argv[4];
-            if (argc > 5 && !strcmp(argv[5], "inplace"))
+            if (argc == 6 && !strcmp(argv[5], "inplace")) {
                 in_place = true;
+            } else {
+                goto invalid_err;
+            }
 
             LOGI("FDE partition: %s, mount point: %s, inplace: %d.\n",
                                  fde_partition, mount_point, in_place);
